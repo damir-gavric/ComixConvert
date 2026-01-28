@@ -35,3 +35,8 @@ It focuses on predictable output, batch processing, and control over image quali
 
 ```bash
 pip install pillow img2pdf tkinterdnd2
+```
+
+### License
+
+- MIT
