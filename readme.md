@@ -5,6 +5,8 @@
 
 It focuses on predictable output, batch processing, and control over image quality, without relying on ImageMagick or Calibre.
 
+![ComixConvert screenshot](docs/screenshot.png)
+
 ---
 
 ## Features
