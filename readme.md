@@ -1,9 +1,9 @@
 # ComixConvert
 
-**ComixConvert** is a lightweight tool for converting comic archives  
+**ComixConvert** is a lightweight desktop tool for converting comic archives  
 (**CBR / CBZ**) into **PDF and EPUB** formats.
 
-![ComixConvert screenshot](docs/screenshot.png)
+It focuses on predictable output, batch processing, and control over image quality, without relying on ImageMagick or Calibre.
 
 ---
 
