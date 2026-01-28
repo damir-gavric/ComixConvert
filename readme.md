@@ -33,5 +33,3 @@ It focuses on predictable output, batch processing, and control over image quali
 
 ```bash
 pip install pillow img2pdf tkinterdnd2
-
-<img width="1506" height="777" alt="image" src="https://github.com/user-attachments/assets/9d742c69-9d23-4834-b637-e27670338dcd" />
