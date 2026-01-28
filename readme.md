@@ -1,6 +1,6 @@
 # ComixConvert
 
-**ComixConvert** is a lightweight desktop tool for converting comic archives  
+**ComixConvert** is a tool for converting comic archives  
 (**CBR / CBZ**) into **PDF and EPUB** formats.
 
 It focuses on predictable output, batch processing, and control over image quality, without relying on ImageMagick or Calibre.
@@ -33,3 +33,5 @@ It focuses on predictable output, batch processing, and control over image quali
 
 ```bash
 pip install pillow img2pdf tkinterdnd2
+
+<img width="1506" height="777" alt="image" src="https://github.com/user-attachments/assets/9d742c69-9d23-4834-b637-e27670338dcd" />
