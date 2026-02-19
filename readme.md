@@ -19,8 +19,7 @@ It focuses on predictable output, batch processing, and control over image quali
 - EPUB support with **first image as cover** (optional)
 - One image per page (no image splitting)
 - Built-in log window
-- File-level progress bar
-- Simple, native GUI (Tkinter)
+- Multi level progress bar
 
 ---
 
