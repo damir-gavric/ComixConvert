@@ -1,20 +1,22 @@
 import os
+import sys
 import shutil
 import tempfile
 import subprocess
-import threading
 import zipfile
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from tkinter.scrolledtext import ScrolledText
 from xml.sax.saxutils import escape
 
 from PIL import Image
 import img2pdf
 
-# Drag & Drop
-from tkinterdnd2 import DND_FILES, TkinterDnD
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QCheckBox, QPushButton, QListWidget, QProgressBar,
+    QPlainTextEdit, QGroupBox, QFormLayout, QFileDialog, QMessageBox,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QFont
 
 SUPPORTED_EXTS = {".cbz", ".cbr", ".zip", ".rar"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -265,247 +267,42 @@ def find_archives_in_folder(folder: Path) -> list[Path]:
     return items
 
 
-def split_dnd_list(data: str) -> list[str]:
-    """
-    TkinterDnD gives a string like:
-      '{C:/path/file 1.cbz} {C:/path/file2.cbr}'
-    or plain 'C:/path/file.cbz'
-    """
-    data = data.strip()
-    if not data:
-        return []
-    out = []
-    cur = ""
-    in_brace = False
-    for ch in data:
-        if ch == "{":
-            in_brace = True
-            cur = ""
-        elif ch == "}":
-            in_brace = False
-            if cur:
-                out.append(cur)
-                cur = ""
-        elif ch == " " and not in_brace:
-            if cur:
-                out.append(cur)
-                cur = ""
-        else:
-            cur += ch
-    if cur:
-        out.append(cur)
-    return out
+class ConvertWorker(QThread):
+    log_line = pyqtSignal(str)
+    progress = pyqtSignal(int, int)   # current, total
+    finished = pyqtSignal(int, int)   # ok, fail
 
+    def __init__(self, files, out_dir, quality, export_pdf, export_epub,
+                 epub_cover, seven_zip):
+        super().__init__()
+        self.files = files
+        self.out_dir = out_dir
+        self.quality = quality
+        self.export_pdf = export_pdf
+        self.export_epub = export_epub
+        self.epub_cover = epub_cover
+        self.seven_zip = seven_zip
 
-class App:
-    def __init__(self, root: TkinterDnD.Tk):
-        self.root = root
-        root.title("CBR/CBZ → PDF/EPUB (Quality, Drag&Drop, Batch, Log)")
-        root.geometry("900x650")
-
-        self.seven_zip = find_7z_exe()
-        self.files: list[Path] = []
-        self.is_running = False
-
-        main = ttk.Frame(root, padding=12)
-        main.pack(fill="both", expand=True)
-
-        left = ttk.Frame(main)
-        left.pack(side="left", fill="y")
-
-        right = ttk.Frame(main)
-        right.pack(side="right", fill="both", expand=True, padx=(12, 0))
-
-        # Quality
-        ttk.Label(left, text="JPEG quality (default 85):").pack(anchor="w")
-        self.quality = ttk.Scale(left, from_=40, to=100, orient="horizontal")
-        self.quality.set(85)
-        self.quality.pack(fill="x", pady=(4, 8))
-
-        self.q_label = ttk.Label(left, text="85")
-        self.q_label.pack(anchor="w", pady=(0, 10))
-        self.quality.configure(command=lambda _v: self.q_label.config(text=str(int(self.quality.get()))))
-
-        # Export options
-        self.export_pdf = tk.BooleanVar(value=True)
-        self.export_epub = tk.BooleanVar(value=False)
-
-        ttk.Checkbutton(left, text="Export PDF", variable=self.export_pdf).pack(anchor="w")
-        ttk.Checkbutton(left, text="Export EPUB", variable=self.export_epub).pack(anchor="w", pady=(0, 10))
-
-        # Cover option for EPUB
-        self.epub_cover = tk.BooleanVar(value=True)
-        ttk.Checkbutton(left, text="EPUB: first image as cover", variable=self.epub_cover).pack(anchor="w", pady=(0, 10))
-
-        # Buttons
-        ttk.Button(left, text="Select files…", command=self.select_files).pack(fill="x", pady=3)
-        ttk.Button(left, text="Select folder (recursive)…", command=self.select_folder).pack(fill="x", pady=3)
-        ttk.Button(left, text="Clear list", command=self.clear_list).pack(fill="x", pady=(3, 10))
-
-        self.out_btn = ttk.Button(left, text="Convert →", command=self.start_convert_thread)
-        self.out_btn.pack(fill="x", pady=3)
-
-        # Progress bar (per-file)
-        self.progress = ttk.Progressbar(left, orient="horizontal", mode="determinate", length=240)
-        self.progress.pack(fill="x", pady=(10, 5))
-        self.progress_label = ttk.Label(left, text="Progress: 0 / 0")
-        self.progress_label.pack(anchor="w")
-
-        # Status
-        self.info = ttk.Label(left, text="", wraplength=280, foreground="#444")
-        self.info.pack(fill="x", pady=(10, 0))
-
-        # Drop zone
-        self.drop = ttk.Label(
-            right,
-            text="⬇️ Drag & drop CBZ/CBR files or folders here",
-            anchor="center",
-            relief="ridge",
-            padding=18
-        )
-        self.drop.pack(fill="x")
-
-        self.drop.drop_target_register(DND_FILES)
-        self.drop.dnd_bind("<<Drop>>", self.on_drop)
-
-        # Queue list
-        ttk.Label(right, text="Queue:").pack(anchor="w", pady=(10, 3))
-        self.queue_box = ScrolledText(right, height=8)
-        self.queue_box.pack(fill="x")
-        self.queue_box.configure(state="disabled")
-
-        # Log
-        ttk.Label(right, text="Log:").pack(anchor="w", pady=(10, 3))
-        self.log_box = ScrolledText(right)
-        self.log_box.pack(fill="both", expand=True)
-
-        if not self.seven_zip:
-            self.set_info(
-                "⚠️ 7z.exe not found.\n"
-                "Install 7-Zip or add it to PATH.\n"
-                "Expected: C:\\Program Files\\7-Zip\\7z.exe"
-            )
-            self.out_btn.state(["disabled"])
-        else:
-            self.set_info("Ready. Add files or a folder. Drag&drop works.")
-
-    def set_info(self, text: str):
-        self.info.config(text=text)
-
-    def log(self, text: str):
-        self.log_box.insert("end", text + "\n")
-        self.log_box.see("end")
-        self.root.update_idletasks()
-
-    def refresh_queue(self):
-        self.queue_box.configure(state="normal")
-        self.queue_box.delete("1.0", "end")
-        for p in self.files:
-            self.queue_box.insert("end", str(p) + "\n")
-        self.queue_box.configure(state="disabled")
-        self.set_info(
-            f"Queue: {len(self.files)} item(s). "
-            f"Quality: {int(self.quality.get())}. "
-            f"PDF={self.export_pdf.get()} EPUB={self.export_epub.get()}"
-        )
-
-    def add_paths(self, paths: list[Path]):
-        added = 0
-        for p in paths:
-            if p.is_dir():
-                archives = find_archives_in_folder(p)
-                for a in archives:
-                    if a not in self.files:
-                        self.files.append(a)
-                        added += 1
-            else:
-                if p.suffix.lower() in SUPPORTED_EXTS and p not in self.files:
-                    self.files.append(p)
-                    added += 1
-
-        self.files.sort(key=lambda x: str(x).lower())
-        self.refresh_queue()
-        self.log(f"Added {added} item(s)." if added else "Nothing new added (duplicates/unsupported).")
-
-    def clear_list(self):
-        self.files = []
-        self.refresh_queue()
-        self.log("Queue cleared.")
-
-    def select_files(self):
-        picked = filedialog.askopenfilenames(
-            title="Select .cbr / .cbz files",
-            filetypes=[("Comic archives", "*.cbr *.cbz *.rar *.zip"), ("All files", "*.*")]
-        )
-        if picked:
-            self.add_paths([Path(p) for p in picked])
-
-    def select_folder(self):
-        folder = filedialog.askdirectory(title="Select folder (recursive search for CBZ/CBR)")
-        if folder:
-            self.add_paths([Path(folder)])
-
-    def on_drop(self, event):
-        items = split_dnd_list(event.data)
-        self.add_paths([Path(i) for i in items])
-
-    def start_convert_thread(self):
-        if self.is_running:
-            messagebox.showinfo("Running", "Conversion is already running.")
-            return
-
-        if not self.files:
-            messagebox.showwarning("No files", "Add CBZ/CBR files (or a folder) first.")
-            return
-
-        if not (self.export_pdf.get() or self.export_epub.get()):
-            messagebox.showwarning("Nothing selected", "Select PDF and/or EPUB export.")
-            return
-
-        if not self.seven_zip:
-            messagebox.showerror("7-Zip missing", "7z.exe not found.")
-            return
-
-        out_dir = filedialog.askdirectory(title="Choose output folder for exports")
-        if not out_dir:
-            return
-
-        # Reset progress
-        self.progress["value"] = 0
-        self.progress["maximum"] = len(self.files)
-        self.progress_label.config(text=f"Progress: 0 / {len(self.files)}")
-
-        self.is_running = True
-        self.out_btn.state(["disabled"])
-
-        t = threading.Thread(target=self.convert_all, args=(Path(out_dir),), daemon=True)
-        t.start()
-
-    def convert_all(self, out_dir: Path):
-        quality = int(self.quality.get())
+    def run(self):
         ok = 0
         fail = 0
-        failures: list[tuple[str, str]] = []
+        failures = []
+        total = len(self.files)
 
-        self.log("=" * 82)
-        self.log(f"Start. Output: {out_dir}")
-        self.log(f"Quality: {quality}")
-        self.log(f"Export: PDF={self.export_pdf.get()} EPUB={self.export_epub.get()} (cover={self.epub_cover.get()})")
-        self.log(f"Items: {len(self.files)}")
-        self.log("=" * 82)
+        self.log_line.emit("=" * 60)
+        self.log_line.emit(f"Output: {self.out_dir}")
+        self.log_line.emit(f"Quality: {self.quality}")
+        self.log_line.emit(
+            f"Export: PDF={self.export_pdf} EPUB={self.export_epub} "
+            f"(cover={self.epub_cover})"
+        )
+        self.log_line.emit(f"Items: {total}")
+        self.log_line.emit("=" * 60)
 
         for idx, archive in enumerate(self.files, start=1):
-            # Update UI progress (start of item)
-            self.root.after(
-                0,
-                lambda i=idx: (
-                    self.progress.config(value=i - 1),
-                    self.progress_label.config(text=f"Progress: {i - 1} / {len(self.files)}")
-                )
-            )
-
+            self.progress.emit(idx - 1, total)
             try:
-                self.log(f"[{idx}/{len(self.files)}] Extract: {archive.name}")
+                self.log_line.emit(f"[{idx}/{total}] Extract: {archive.name}")
                 with tempfile.TemporaryDirectory(prefix="comic2export_") as tmp:
                     tmp_path = Path(tmp)
                     extract_dir = tmp_path / "extracted"
@@ -519,87 +316,377 @@ class App:
                     if not imgs:
                         raise RuntimeError("No images found after extraction.")
 
-                    self.log(f"  Images: {len(imgs)} → JPEG (q={quality})")
-                    jpegs = convert_to_jpegs(imgs, jpeg_dir, quality)
+                    self.log_line.emit(
+                        f"  Images: {len(imgs)} → JPEG (q={self.quality})"
+                    )
+                    jpegs = convert_to_jpegs(imgs, jpeg_dir, self.quality)
 
-                    if self.export_pdf.get():
-                        out_pdf = out_dir / (archive.stem + ".pdf")
-                        self.log(f"  Build PDF: {out_pdf.name}")
+                    if self.export_pdf:
+                        out_pdf = self.out_dir / (archive.stem + ".pdf")
+                        self.log_line.emit(f"  Build PDF: {out_pdf.name}")
                         images_to_pdf(jpegs, out_pdf)
 
-                    if self.export_epub.get():
-                        out_epub = out_dir / (archive.stem + ".epub")
-                        self.log(f"  Build EPUB: {out_epub.name}")
+                    if self.export_epub:
+                        out_epub = self.out_dir / (archive.stem + ".epub")
+                        self.log_line.emit(f"  Build EPUB: {out_epub.name}")
                         build_epub_from_images(
                             jpegs=jpegs,
                             out_epub=out_epub,
                             title=archive.stem,
-                            use_first_image_as_cover=self.epub_cover.get()
+                            use_first_image_as_cover=self.epub_cover,
                         )
 
-                self.log("  ✅ OK")
+                self.log_line.emit("  OK")
                 ok += 1
-
-                # Update UI progress (end of item)
-                self.root.after(
-                    0,
-                    lambda i=idx: (
-                        self.progress.config(value=i),
-                        self.progress_label.config(text=f"Progress: {i} / {len(self.files)}")
-                    )
-                )
+                self.progress.emit(idx, total)
 
             except Exception as e:
                 fail += 1
                 failures.append((archive.name, str(e)))
-                self.log(f"  ❌ FAIL: {e}")
+                self.log_line.emit(f"  FAIL: {e}")
+                self.progress.emit(idx, total)
 
-                self.root.after(
-                    0,
-                    lambda i=idx: (
-                        self.progress.config(value=i),
-                        self.progress_label.config(text=f"Progress: {i} / {len(self.files)}")
-                    )
-                )
-
-        self.log("-" * 82)
-        self.log(f"Done. OK={ok}, FAIL={fail}")
-        if fail:
-            self.log("Failures summary:")
+        self.log_line.emit("-" * 60)
+        self.log_line.emit(f"Done. OK={ok}, FAIL={fail}")
+        if failures:
             for name, err in failures[:10]:
-                self.log(f" - {name}: {err}")
-            if len(failures) > 10:
-                self.log(f" (+{len(failures) - 10} more)")
-        self.log("-" * 82)
+                self.log_line.emit(f"  - {name}: {err}")
+        self.log_line.emit("-" * 60)
 
-        def finish():
-            self.is_running = False
-            self.out_btn.state(["!disabled"])
-            # Force 100%
-            self.progress["value"] = self.progress["maximum"]
-            self.progress_label.config(text=f"Progress: {self.progress['maximum']} / {self.progress['maximum']}")
+        self.finished.emit(ok, fail)
 
-            if fail == 0:
-                messagebox.showinfo("Done", f"Converted {ok} file(s).\nOutput: {out_dir}")
-            else:
-                messagebox.showwarning("Partial success", f"OK={ok}, FAIL={fail}\nCheck Log for details.")
-            self.set_info(f"Done. OK={ok}, FAIL={fail}. Quality: {quality}")
 
-        self.root.after(0, finish)
+class DropZone(QLabel):
+    def __init__(self, on_drop, parent=None):
+        super().__init__(parent)
+        self._on_drop = on_drop
+        self.setText("Drop CBZ / CBR files or folders here")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(80)
+        self.setObjectName("DropZone")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.setProperty("dragover", True)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.setProperty("dragover", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def dropEvent(self, event):
+        self.setProperty("dragover", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        paths = [
+            Path(url.toLocalFile())
+            for url in event.mimeData().urls()
+            if url.isLocalFile()
+        ]
+        if paths:
+            self._on_drop(paths)
+        event.acceptProposedAction()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ComixConvert")
+        self.setMinimumSize(700, 600)
+        self.resize(820, 680)
+
+        self.seven_zip = find_7z_exe()
+        self.files: list[Path] = []
+        self._worker = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        self._layout = QVBoxLayout(central)
+        self._layout.setContentsMargins(16, 16, 16, 16)
+        self._layout.setSpacing(12)
+
+        self._build_drop_zone()
+        self._build_settings()
+        self._build_buttons()
+        self._build_queue()
+        self._build_progress()
+        self._build_log()
+
+        self._apply_stylesheet()
+
+        if not self.seven_zip:
+            self._log("WARNING: 7z.exe not found. Install 7-Zip or add it to PATH.")
+            self._btn_convert.setEnabled(False)
+        else:
+            self._log("Ready. Add files or drag & drop.")
+
+    def _build_drop_zone(self):
+        self._drop_zone = DropZone(on_drop=self.add_paths)
+        self._layout.addWidget(self._drop_zone)
+
+    def _build_settings(self):
+        group = QGroupBox("Settings")
+        form = QFormLayout(group)
+        form.setSpacing(8)
+
+        slider_row = QHBoxLayout()
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(40, 100)
+        self._slider.setValue(85)
+        self._slider_label = QLabel("85")
+        self._slider_label.setFixedWidth(28)
+        self._slider.valueChanged.connect(
+            lambda v: self._slider_label.setText(str(v))
+        )
+        slider_row.addWidget(self._slider)
+        slider_row.addWidget(self._slider_label)
+        form.addRow("JPEG quality:", slider_row)
+
+        export_row = QHBoxLayout()
+        self._chk_pdf = QCheckBox("PDF")
+        self._chk_pdf.setChecked(True)
+        self._chk_epub = QCheckBox("EPUB")
+        export_row.addWidget(self._chk_pdf)
+        export_row.addWidget(self._chk_epub)
+        export_row.addStretch()
+        form.addRow("Output:", export_row)
+
+        self._chk_cover = QCheckBox("Use first image as cover")
+        self._chk_cover.setChecked(True)
+        form.addRow("EPUB option:", self._chk_cover)
+
+        self._layout.addWidget(group)
+
+    def _build_buttons(self):
+        row = QHBoxLayout()
+        btn_files = QPushButton("Select files…")
+        btn_folder = QPushButton("Select folder…")
+        btn_clear = QPushButton("Clear")
+        self._btn_convert = QPushButton("Convert →")
+        self._btn_convert.setObjectName("ConvertBtn")
+
+        btn_files.clicked.connect(self.select_files)
+        btn_folder.clicked.connect(self.select_folder)
+        btn_clear.clicked.connect(self.clear_list)
+        self._btn_convert.clicked.connect(self.start_convert)
+
+        row.addWidget(btn_files)
+        row.addWidget(btn_folder)
+        row.addWidget(btn_clear)
+        row.addStretch()
+        row.addWidget(self._btn_convert)
+        self._layout.addLayout(row)
+
+    def _build_queue(self):
+        self._queue_label = QLabel("Queue (0 files)")
+        self._layout.addWidget(self._queue_label)
+        self._queue_list = QListWidget()
+        self._queue_list.setFixedHeight(110)
+        self._layout.addWidget(self._queue_list)
+
+    def _build_progress(self):
+        self._progress = QProgressBar()
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("%v / %m")
+        self._progress.setValue(0)
+        self._progress.setMaximum(0)
+        self._layout.addWidget(self._progress)
+
+    def _build_log(self):
+        self._layout.addWidget(QLabel("Log"))
+        self._log_box = QPlainTextEdit()
+        self._log_box.setReadOnly(True)
+        self._log_box.setFont(QFont("Consolas", 9))
+        self._layout.addWidget(self._log_box)
+
+    # --- Task 5: File management ---
+
+    def _log(self, text: str):
+        self._log_box.appendPlainText(text)
+
+    def _refresh_queue(self):
+        self._queue_list.clear()
+        for p in self.files:
+            self._queue_list.addItem(str(p))
+        self._queue_label.setText(f"Queue ({len(self.files)} files)")
+
+    def add_paths(self, paths: list[Path]):
+        added = 0
+        for p in paths:
+            if p.is_dir():
+                for a in find_archives_in_folder(p):
+                    if a not in self.files:
+                        self.files.append(a)
+                        added += 1
+            elif p.suffix.lower() in SUPPORTED_EXTS and p not in self.files:
+                self.files.append(p)
+                added += 1
+        self.files.sort(key=lambda x: str(x).lower())
+        self._refresh_queue()
+        self._log(
+            f"Added {added} item(s)."
+            if added else "Nothing new added (duplicates/unsupported)."
+        )
+
+    def clear_list(self):
+        self.files = []
+        self._refresh_queue()
+        self._log("Queue cleared.")
+
+    def select_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select .cbr / .cbz files",
+            "",
+            "Comic archives (*.cbr *.cbz *.rar *.zip);;All files (*.*)",
+        )
+        if paths:
+            self.add_paths([Path(p) for p in paths])
+
+    def select_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select folder (recursive search for CBZ/CBR)"
+        )
+        if folder:
+            self.add_paths([Path(folder)])
+
+    # --- Task 6: ConvertWorker wiring ---
+
+    def start_convert(self):
+        if not self.files:
+            QMessageBox.warning(self, "No files", "Add CBZ/CBR files first.")
+            return
+        if not self._chk_pdf.isChecked() and not self._chk_epub.isChecked():
+            QMessageBox.warning(self, "Nothing selected", "Select PDF and/or EPUB export.")
+            return
+        if not self.seven_zip:
+            QMessageBox.critical(self, "7-Zip missing", "7z.exe not found.")
+            return
+
+        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder")
+        if not out_dir:
+            return
+
+        self._progress.setMaximum(len(self.files))
+        self._progress.setValue(0)
+        self._btn_convert.setEnabled(False)
+
+        self._worker = ConvertWorker(
+            files=list(self.files),
+            out_dir=Path(out_dir),
+            quality=self._slider.value(),
+            export_pdf=self._chk_pdf.isChecked(),
+            export_epub=self._chk_epub.isChecked(),
+            epub_cover=self._chk_cover.isChecked(),
+            seven_zip=self.seven_zip,
+        )
+        self._worker.log_line.connect(self._log)
+        self._worker.progress.connect(
+            lambda cur, _total: self._progress.setValue(cur)
+        )
+        self._worker.finished.connect(self._on_convert_finished)
+        self._worker.start()
+
+    def _on_convert_finished(self, ok: int, fail: int):
+        self._btn_convert.setEnabled(True)
+        self._progress.setValue(self._progress.maximum())
+        if fail == 0:
+            QMessageBox.information(self, "Done", f"Converted {ok} file(s).")
+        else:
+            QMessageBox.warning(
+                self, "Partial success", f"OK={ok}, FAIL={fail}\nCheck Log."
+            )
+
+    # --- Task 7: QSS Stylesheet ---
+
+    def _apply_stylesheet(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #f5f5f5;
+                color: #1a1a1a;
+                font-family: Segoe UI, Arial, sans-serif;
+                font-size: 10pt;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                margin-top: 6px;
+                padding-top: 8px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 8px;
+                padding: 0 4px;
+                color: #444;
+            }
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #c0c0c0;
+                border-radius: 4px;
+                padding: 5px 14px;
+            }
+            QPushButton:hover {
+                background-color: #e8e8e8;
+                border-color: #999;
+            }
+            QPushButton#ConvertBtn {
+                background-color: #0078d4;
+                color: #ffffff;
+                border: none;
+                font-weight: bold;
+                padding: 5px 20px;
+            }
+            QPushButton#ConvertBtn:hover {
+                background-color: #106ebe;
+            }
+            QPushButton#ConvertBtn:disabled {
+                background-color: #a0c4e8;
+            }
+            QLabel#DropZone {
+                border: 2px dashed #b0b0b0;
+                border-radius: 6px;
+                color: #888;
+                font-size: 11pt;
+                padding: 20px;
+                background-color: #fafafa;
+            }
+            QLabel#DropZone[dragover="true"] {
+                border-color: #0078d4;
+                color: #0078d4;
+                background-color: #e8f2fc;
+            }
+            QProgressBar {
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                background-color: #e8e8e8;
+                height: 18px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #0078d4;
+                border-radius: 3px;
+            }
+            QListWidget, QPlainTextEdit {
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                background-color: #ffffff;
+            }
+        """)
 
 
 def main():
-    root = TkinterDnD.Tk()
-
-    try:
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-    except Exception:
-        pass
-
-    App(root)
-    root.mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
