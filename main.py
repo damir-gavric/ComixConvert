@@ -15,13 +15,14 @@ import img2pdf
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QCheckBox, QPushButton, QListWidget, QProgressBar,
-    QPlainTextEdit, QGroupBox, QFormLayout, QFileDialog, QMessageBox,
+    QPlainTextEdit, QFileDialog, QMessageBox, QFrame, QLineEdit, QListWidgetItem,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings
+from PyQt6.QtGui import QFont, QIcon
 
 SUPPORTED_EXTS = {".cbz", ".cbr", ".zip", ".rar"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.svg"
 
 _NSRE = re.compile(r"(\d+)")
 
@@ -482,162 +483,422 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ComixConvert")
-        self.setMinimumSize(700, 600)
-        self.resize(820, 680)
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        self.setMinimumSize(1120, 760)
+        self.resize(1320, 860)
 
+        self._settings = QSettings("ComixConvert", "ComixConvert")
         self.seven_zip = find_7z_exe()
         self.files: list[Path] = []
         self._worker = None
         self._last_out_dir: str | None = None
 
         central = QWidget()
+        central.setObjectName("Root")
         self.setCentralWidget(central)
         self._layout = QVBoxLayout(central)
-        self._layout.setContentsMargins(16, 16, 16, 16)
-        self._layout.setSpacing(12)
+        self._layout.setContentsMargins(20, 18, 20, 20)
+        self._layout.setSpacing(14)
 
-        self._build_drop_zone()
-        self._build_settings()
-        self._build_buttons()
-        self._build_queue()
-        self._build_progress()
-        self._build_log()
-
+        self._build_header()
+        self._build_main_area()
         self._apply_stylesheet()
+        self._restore_settings()
+        self._sync_epub_options()
+        self._refresh_queue()
+        self._set_status("Ready")
 
         if not self.seven_zip:
+            self._warning_badge.setText("7-Zip missing")
+            self._warning_badge.setObjectName("WarningBadge")
+            self._warning_badge.style().unpolish(self._warning_badge)
+            self._warning_badge.style().polish(self._warning_badge)
             self._log("WARNING: 7z.exe not found. Install 7-Zip or add it to PATH.")
             self._btn_convert.setEnabled(False)
         else:
             self._log("Ready. Add files or drag & drop.")
 
-    def _build_drop_zone(self):
-        self._drop_zone = DropZone(on_drop=self.add_paths)
-        self._layout.addWidget(self._drop_zone)
+    def _make_card(self, title: str, object_name: str = "Card"):
+        card = QFrame()
+        card.setObjectName(object_name)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
 
-    def _build_settings(self):
-        group = QGroupBox("Settings")
-        form = QFormLayout(group)
-        form.setSpacing(8)
+        title_label = QLabel(title)
+        title_label.setObjectName("CardTitle")
+        layout.addWidget(title_label)
+        return card, layout
+
+    def _build_header(self):
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+
+        title = QLabel("ComixConvert")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("Convert comic archives to clean PDF and EPUB editions")
+        subtitle.setObjectName("AppSubtitle")
+        title_col.addWidget(title)
+        title_col.addWidget(subtitle)
+
+        row.addLayout(title_col)
+        row.addStretch()
+
+        self._warning_badge = QLabel("7-Zip detected")
+        self._warning_badge.setObjectName("Badge")
+        row.addWidget(self._warning_badge)
+
+        self._layout.addLayout(row)
+
+    def _build_main_area(self):
+        split = QHBoxLayout()
+        split.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(14)
+        right = QVBoxLayout()
+        right.setSpacing(14)
+
+        split.addLayout(left, 5)
+        split.addLayout(right, 3)
+        self._layout.addLayout(split, 1)
+
+        self._build_import_card(left)
+        self._build_queue_card(left)
+        self._build_bottom_panel(left)
+        self._build_sidebar(right)
+
+    def _build_import_card(self, parent_layout):
+        card, layout = self._make_card("Import")
+        self._drop_zone = DropZone(on_drop=self.add_paths)
+        self._drop_zone.setMinimumHeight(88)
+        layout.addWidget(self._drop_zone)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self._btn_files = QPushButton("Add files +")
+        self._btn_folder = QPushButton("Add folder +")
+        self._btn_files.clicked.connect(self.select_files)
+        self._btn_folder.clicked.connect(self.select_folder)
+        row.addWidget(self._btn_files)
+        row.addWidget(self._btn_folder)
+        row.addStretch()
+        layout.addLayout(row)
+
+        parent_layout.addWidget(card)
+
+    def _build_queue_card(self, parent_layout):
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(10)
+
+        title = QLabel("Queue")
+        title.setObjectName("CardTitle")
+        header.addWidget(title)
+
+        self._queue_badge = QLabel("0 items")
+        self._queue_badge.setObjectName("CountBadge")
+        header.addWidget(self._queue_badge)
+        header.addStretch()
+
+        self._btn_remove_selected = QPushButton("Remove")
+        self._btn_clear = QPushButton("Clear all")
+        self._btn_remove_selected.clicked.connect(self.remove_selected)
+        self._btn_clear.clicked.connect(self.clear_list)
+        header.addWidget(self._btn_remove_selected)
+        header.addWidget(self._btn_clear)
+        layout.addLayout(header)
+
+        self._queue_list = QListWidget()
+        self._queue_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self._queue_list.setObjectName("QueueList")
+        layout.addWidget(self._queue_list, 1)
+
+        self._queue_hint = QLabel("Drop archives here or use Add files / Add folder to build your queue.")
+        self._queue_hint.setObjectName("HintText")
+        layout.addWidget(self._queue_hint)
+
+        parent_layout.addWidget(card, 1)
+
+    def _build_sidebar(self, parent_layout):
+        settings_card, settings_layout = self._make_card("Export Settings")
+
+        format_label = QLabel("Format")
+        format_label.setObjectName("SectionLabel")
+        settings_layout.addWidget(format_label)
+
+        format_row = QHBoxLayout()
+        format_row.setSpacing(10)
+        self._chk_pdf = QCheckBox("PDF")
+        self._chk_pdf.setChecked(True)
+        self._chk_pdf.setObjectName("PillCheck")
+        self._chk_epub = QCheckBox("EPUB")
+        self._chk_epub.setChecked(True)
+        self._chk_epub.setObjectName("PillCheck")
+        self._chk_pdf.toggled.connect(self._update_summary)
+        self._chk_pdf.toggled.connect(self._save_settings)
+        self._chk_epub.toggled.connect(self._sync_epub_options)
+        self._chk_epub.toggled.connect(self._update_summary)
+        self._chk_epub.toggled.connect(self._save_settings)
+        format_row.addWidget(self._chk_pdf)
+        format_row.addWidget(self._chk_epub)
+        format_row.addStretch()
+        settings_layout.addLayout(format_row)
+
+        quality_label = QLabel("JPEG Quality")
+        quality_label.setObjectName("SectionLabel")
+        settings_layout.addWidget(quality_label)
 
         slider_row = QHBoxLayout()
+        slider_row.setSpacing(10)
         self._slider = QSlider(Qt.Orientation.Horizontal)
         self._slider.setRange(40, 100)
         self._slider.setValue(85)
         self._slider_label = QLabel("85")
-        self._slider_label.setFixedWidth(28)
+        self._slider_label.setObjectName("ValueLabel")
         self._slider.valueChanged.connect(lambda v: self._slider_label.setText(str(v)))
-        slider_row.addWidget(self._slider)
+        self._slider.valueChanged.connect(self._update_summary)
+        self._slider.valueChanged.connect(self._save_settings)
+        slider_row.addWidget(self._slider, 1)
         slider_row.addWidget(self._slider_label)
-        form.addRow("JPEG quality:", slider_row)
+        settings_layout.addLayout(slider_row)
 
-        export_row = QHBoxLayout()
-        self._chk_pdf = QCheckBox("PDF")
-        self._chk_pdf.setChecked(True)
-        self._chk_epub = QCheckBox("EPUB")
-        export_row.addWidget(self._chk_pdf)
-        export_row.addWidget(self._chk_epub)
-        export_row.addStretch()
-        form.addRow("Output:", export_row)
+        self._epub_options_label = QLabel("EPUB Options")
+        self._epub_options_label.setObjectName("SectionLabel")
+        settings_layout.addWidget(self._epub_options_label)
 
         self._chk_cover = QCheckBox("Use first image as cover")
         self._chk_cover.setChecked(True)
-        form.addRow("EPUB option:", self._chk_cover)
-
-        self._chk_skip_cover_page = QCheckBox("Do not duplicate cover as page 1")
+        self._chk_skip_cover_page = QCheckBox("Skip duplicate page 1")
         self._chk_skip_cover_page.setChecked(True)
-        form.addRow("", self._chk_skip_cover_page)
+        self._chk_cover.toggled.connect(self._sync_epub_options)
+        self._chk_skip_cover_page.toggled.connect(self._update_summary)
+        self._chk_skip_cover_page.toggled.connect(self._save_settings)
+        self._chk_cover.toggled.connect(self._update_summary)
+        self._chk_cover.toggled.connect(self._save_settings)
+        settings_layout.addWidget(self._chk_cover)
+        settings_layout.addWidget(self._chk_skip_cover_page)
 
-        self._layout.addWidget(group)
+        parent_layout.addWidget(settings_card, 3)
 
-    def _build_buttons(self):
-        row = QHBoxLayout()
+        output_card, output_layout = self._make_card("Output Folder")
+        path_row = QHBoxLayout()
+        path_row.setSpacing(8)
+        self._out_dir_input = QLineEdit()
+        self._out_dir_input.setPlaceholderText("Choose where converted files will be written")
+        self._out_dir_input.textChanged.connect(self._update_summary)
+        self._out_dir_input.textChanged.connect(self._update_convert_button)
+        self._out_dir_input.textChanged.connect(self._save_settings)
+        self._btn_browse_out = QPushButton("Browse...")
+        self._btn_browse_out.clicked.connect(self.browse_output_folder)
+        path_row.addWidget(self._out_dir_input, 1)
+        path_row.addWidget(self._btn_browse_out)
+        output_layout.addLayout(path_row)
 
-        self._btn_files = QPushButton("Select files…")
-        self._btn_folder = QPushButton("Select folder…")
-        self._btn_remove_selected = QPushButton("Remove selected")
-        self._btn_clear = QPushButton("Clear")
-        self._btn_open_out = QPushButton("Open output folder")
+        self._btn_open_out = QPushButton("Open output")
         self._btn_open_out.setEnabled(False)
-
-        self._btn_convert = QPushButton("Convert →")
-        self._btn_convert.setObjectName("ConvertBtn")
-
-        self._btn_files.clicked.connect(self.select_files)
-        self._btn_folder.clicked.connect(self.select_folder)
-        self._btn_remove_selected.clicked.connect(self.remove_selected)
-        self._btn_clear.clicked.connect(self.clear_list)
         self._btn_open_out.clicked.connect(self.open_output_folder)
+        output_layout.addWidget(self._btn_open_out)
+        parent_layout.addWidget(output_card, 2)
+
+        summary_card, summary_layout = self._make_card("Ready to Convert")
+        summary_card.setObjectName("AccentCard")
+
+        summary_row = QHBoxLayout()
+        summary_row.setSpacing(12)
+        self._summary_files = QLabel()
+        self._summary_files.setObjectName("SummaryMetric")
+        self._summary_format = QLabel()
+        self._summary_format.setObjectName("SummaryMetric")
+        self._summary_quality = QLabel()
+        self._summary_quality.setObjectName("SummaryMetric")
+        summary_row.addWidget(self._summary_files)
+        summary_row.addWidget(self._summary_format)
+        summary_row.addWidget(self._summary_quality)
+        summary_row.addStretch()
+        summary_layout.addLayout(summary_row)
+
+        self._summary_note = QLabel()
+        self._summary_note.setObjectName("HintText")
+        summary_layout.addWidget(self._summary_note)
+
+        self._btn_convert = QPushButton("Convert")
+        self._btn_convert.setObjectName("ConvertBtn")
         self._btn_convert.clicked.connect(self.start_convert)
+        summary_layout.addWidget(self._btn_convert)
+        parent_layout.addWidget(summary_card, 2)
 
-        row.addWidget(self._btn_files)
-        row.addWidget(self._btn_folder)
-        row.addWidget(self._btn_remove_selected)
-        row.addWidget(self._btn_clear)
-        row.addStretch()
-        row.addWidget(self._btn_open_out)
-        row.addWidget(self._btn_convert)
-        self._layout.addLayout(row)
+    def _build_bottom_panel(self, parent_layout):
+        panel = QFrame()
+        panel.setObjectName("BottomPanel")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
 
-    def _build_queue(self):
-        self._queue_label = QLabel("Queue (0 files)")
-        self._layout.addWidget(self._queue_label)
-        self._queue_list = QListWidget()
-        self._queue_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self._queue_list.setFixedHeight(110)
-        self._layout.addWidget(self._queue_list)
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self._status_label = QLabel()
+        self._status_label.setObjectName("BottomTitle")
+        self._toggle_log_btn = QPushButton("Details")
+        self._toggle_log_btn.setCheckable(True)
+        self._toggle_log_btn.clicked.connect(self._toggle_log_panel)
+        top.addWidget(self._status_label)
+        top.addStretch()
+        top.addWidget(self._toggle_log_btn)
+        layout.addLayout(top)
 
-    def _build_progress(self):
-        # Status line (what is happening now)
-        self._status_label = QLabel("")
-        self._status_label.setObjectName("StatusLabel")
-        self._layout.addWidget(self._status_label)
+        self._progress_info = QLabel("Files: 0 / 0")
+        self._progress_info.setObjectName("HintText")
+        layout.addWidget(self._progress_info)
 
-        # Main progress (files)
         self._progress = QProgressBar()
-        self._progress.setTextVisible(True)
-        self._progress.setFormat("Files: %v / %m")
+        self._progress.setTextVisible(False)
         self._progress.setRange(0, 1)
         self._progress.setValue(0)
-        self._progress.hide()
-        self._layout.addWidget(self._progress)
+        layout.addWidget(self._progress)
 
-        # Sub progress (images in current file)
+        self._subprogress_info = QLabel("Waiting for conversion to start")
+        self._subprogress_info.setObjectName("HintText")
+        layout.addWidget(self._subprogress_info)
+
         self._subprogress = QProgressBar()
-        self._subprogress.setTextVisible(True)
-        self._subprogress.setFormat("Images: %v / %m")
+        self._subprogress.setTextVisible(False)
         self._subprogress.setRange(0, 1)
         self._subprogress.setValue(0)
-        self._subprogress.hide()
-        self._layout.addWidget(self._subprogress)
+        layout.addWidget(self._subprogress)
 
-    def _build_log(self):
-        self._layout.addWidget(QLabel("Log"))
         self._log_box = QPlainTextEdit()
+        self._log_box.setObjectName("LogBox")
         self._log_box.setReadOnly(True)
         self._log_box.setFont(QFont("Consolas", 9))
-        self._layout.addWidget(self._log_box)
+        self._log_box.hide()
+        layout.addWidget(self._log_box)
+
+        parent_layout.addWidget(panel, 1)
+
+    def _restore_settings(self):
+        out_dir = self._settings.value("output_dir", "", str)
+        if out_dir:
+            self._out_dir_input.setText(out_dir)
+            self._last_out_dir = out_dir
+            self._btn_open_out.setEnabled(True)
+
+        self._chk_pdf.setChecked(self._settings.value("export_pdf", True, bool))
+        self._chk_epub.setChecked(self._settings.value("export_epub", True, bool))
+        self._slider.setValue(self._settings.value("jpeg_quality", 85, int))
+        self._chk_cover.setChecked(self._settings.value("epub_cover", True, bool))
+        self._chk_skip_cover_page.setChecked(self._settings.value("epub_skip_cover_page", True, bool))
+
+    def _save_settings(self, *_args):
+        self._settings.setValue("output_dir", self._out_dir_input.text().strip())
+        self._settings.setValue("export_pdf", self._chk_pdf.isChecked())
+        self._settings.setValue("export_epub", self._chk_epub.isChecked())
+        self._settings.setValue("jpeg_quality", self._slider.value())
+        self._settings.setValue("epub_cover", self._chk_cover.isChecked())
+        self._settings.setValue("epub_skip_cover_page", self._chk_skip_cover_page.isChecked())
+
+    def _toggle_log_panel(self, checked: bool):
+        self._log_box.setVisible(checked)
+        self._toggle_log_btn.setText("Hide details" if checked else "Details")
+
+    def _set_status(self, text: str):
+        self._status_label.setText(text)
+
+    def _update_convert_button(self):
+        count = len(self.files)
+        self._btn_convert.setText(f"Convert {count} file{'s' if count != 1 else ''}")
+
+    def _update_summary(self):
+        count = len(self.files)
+        self._summary_files.setText(f"{count} file{'s' if count != 1 else ''}")
+
+        formats = []
+        if self._chk_pdf.isChecked():
+            formats.append("PDF")
+        if self._chk_epub.isChecked():
+            formats.append("EPUB")
+        self._summary_format.setText(" + ".join(formats) if formats else "No format")
+        self._summary_quality.setText(f"Quality {self._slider.value()}")
+
+        if self._out_dir_input.text().strip():
+            self._summary_note.setText("Output folder is ready. Conversion will write files directly there.")
+        else:
+            self._summary_note.setText("Choose an output folder before starting conversion.")
+
+        self._update_convert_button()
+
+    def _sync_epub_options(self):
+        epub_enabled = self._chk_epub.isChecked()
+        self._epub_options_label.setVisible(epub_enabled)
+        self._chk_cover.setVisible(epub_enabled)
+        self._chk_skip_cover_page.setVisible(epub_enabled)
+        self._chk_cover.setEnabled(epub_enabled)
+        self._chk_skip_cover_page.setEnabled(epub_enabled and self._chk_cover.isChecked())
+        self._update_summary()
 
     def _log(self, text: str):
         self._log_box.appendPlainText(text)
 
     def _set_busy(self, busy: bool):
-        self._btn_convert.setEnabled(not busy)
+        self._btn_convert.setEnabled((not busy) and bool(self.seven_zip))
         self._btn_files.setEnabled(not busy)
         self._btn_folder.setEnabled(not busy)
         self._btn_remove_selected.setEnabled(not busy)
         self._btn_clear.setEnabled(not busy)
+        self._btn_browse_out.setEnabled(not busy)
+        self._out_dir_input.setEnabled(not busy)
         self._chk_pdf.setEnabled(not busy)
         self._chk_epub.setEnabled(not busy)
-        self._chk_cover.setEnabled(not busy)
-        self._chk_skip_cover_page.setEnabled(not busy)
+        self._chk_cover.setEnabled((not busy) and self._chk_epub.isChecked())
+        self._chk_skip_cover_page.setEnabled((not busy) and self._chk_epub.isChecked() and self._chk_cover.isChecked())
         self._slider.setEnabled(not busy)
+        self._btn_open_out.setEnabled((not busy) and bool(self._last_out_dir))
+
+    def _make_queue_item_widget(self, path: Path) -> QWidget:
+        row = QFrame()
+        row.setObjectName("QueueRow")
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(12, 9, 12, 9)
+        layout.setSpacing(10)
+
+        badge = QLabel(path.suffix.upper().replace('.', ''))
+        badge.setObjectName("TypeBadge")
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedWidth(44)
+        layout.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+
+        name = QLabel(path.name)
+        name.setObjectName("QueueItemName")
+        folder = QLabel(str(path.parent))
+        folder.setObjectName("QueueItemPath")
+        text_col.addWidget(name)
+        text_col.addWidget(folder)
+        layout.addLayout(text_col, 1)
+        return row
 
     def _refresh_queue(self):
         self._queue_list.clear()
         for p in self.files:
-            self._queue_list.addItem(str(p))
-        self._queue_label.setText(f"Queue ({len(self.files)} files)")
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, str(p))
+            item.setSizeHint(QSize(0, 60))
+            self._queue_list.addItem(item)
+            self._queue_list.setItemWidget(item, self._make_queue_item_widget(p))
+        self._queue_badge.setText(f"{len(self.files)} item{'s' if len(self.files) != 1 else ''}")
+        self._queue_hint.setVisible(len(self.files) == 0)
+        self._update_summary()
 
     def add_paths(self, paths: list[Path]):
         added = 0
@@ -663,7 +924,7 @@ class MainWindow(QMainWindow):
         if not selected:
             self._log("No selection to remove.")
             return
-        remove_set = {Path(it.text()) for it in selected}
+        remove_set = {Path(it.data(Qt.ItemDataRole.UserRole)) for it in selected}
         before = len(self.files)
         self.files = [p for p in self.files if p not in remove_set]
         removed = before - len(self.files)
@@ -692,6 +953,11 @@ class MainWindow(QMainWindow):
         if folder:
             self.add_paths([Path(folder)])
 
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose output folder")
+        if folder:
+            self._out_dir_input.setText(folder)
+
     def start_convert(self):
         if not self.files:
             QMessageBox.warning(self, "No files", "Add CBZ/CBR files first.")
@@ -705,27 +971,25 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "7-Zip missing", "7z.exe not found.")
             return
 
-        out_dir = QFileDialog.getExistingDirectory(self, "Choose output folder")
+        out_dir = self._out_dir_input.text().strip()
         if not out_dir:
+            QMessageBox.warning(self, "No output folder", "Choose an output folder first.")
+            return
+        if not Path(out_dir).exists():
+            QMessageBox.warning(self, "Output folder missing", "The selected output folder does not exist.")
             return
 
         self._last_out_dir = out_dir
         self._btn_open_out.setEnabled(True)
-
-        # show progress UI only while working
-        self._status_label.setText("Starting…")
-
-        self._progress.show()
+        self._set_status("Starting conversion")
+        self._progress_info.setText(f"Files: 0 / {len(self.files)}")
         self._progress.setRange(0, len(self.files))
         self._progress.setValue(0)
-
-        self._subprogress.hide()
+        self._subprogress_info.setText("Preparing archive")
         self._subprogress.setRange(0, 1)
         self._subprogress.setValue(0)
-
         self._set_busy(True)
 
-        # If cover is OFF, skip-cover-page should effectively be OFF
         epub_skip = self._chk_cover.isChecked() and self._chk_skip_cover_page.isChecked()
 
         self._worker = ConvertWorker(
@@ -740,32 +1004,38 @@ class MainWindow(QMainWindow):
         )
 
         self._worker.log_line.connect(self._log)
-
-        self._worker.progress.connect(lambda cur, _total: self._progress.setValue(cur))
-        self._worker.status.connect(self._status_label.setText)
-
-        def on_sub(cur: int, tot: int):
-            if tot <= 0:
-                self._subprogress.hide()
-                return
-            if not self._subprogress.isVisible():
-                self._subprogress.show()
-            self._subprogress.setRange(0, max(tot, 1))
-            self._subprogress.setValue(cur)
-
-        self._worker.subprogress.connect(on_sub)
-
+        self._worker.progress.connect(self._on_file_progress)
+        self._worker.status.connect(self._on_status)
+        self._worker.subprogress.connect(self._on_subprogress)
         self._worker.finished.connect(self._on_convert_finished)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
+    def _on_file_progress(self, cur: int, total: int):
+        self._progress.setRange(0, max(total, 1))
+        self._progress.setValue(cur)
+        self._progress_info.setText(f"Files: {cur} / {total}")
+
+    def _on_status(self, text: str):
+        clean = text.replace("â€¦", "...").replace("â€”", "-")
+        self._set_status(clean)
+        self._subprogress_info.setText(clean)
+
+    def _on_subprogress(self, cur: int, tot: int):
+        if tot <= 0:
+            self._subprogress.setRange(0, 1)
+            self._subprogress.setValue(0)
+            return
+        self._subprogress.setRange(0, max(tot, 1))
+        self._subprogress.setValue(cur)
+
     def _on_convert_finished(self, ok: int, fail: int, out_dir: str):
         self._set_busy(False)
-
-        # hide progress UI after work
-        self._progress.hide()
-        self._subprogress.hide()
-        self._status_label.setText("Ready.")
+        self._set_status("Ready")
+        self._progress_info.setText(f"Files: {ok + fail} / {ok + fail}")
+        self._subprogress_info.setText("Conversion finished")
+        self._subprogress.setRange(0, 1)
+        self._subprogress.setValue(0)
 
         self._last_out_dir = out_dir
         self._btn_open_out.setEnabled(True)
@@ -774,7 +1044,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Done", f"Converted {ok} file(s).")
         else:
             QMessageBox.warning(
-                self, "Partial success", f"OK={ok}, FAIL={fail}\nCheck Log."
+                self, "Partial success", f"OK={ok}, FAIL={fail}\nCheck details for errors."
             )
 
     def open_output_folder(self):
@@ -782,94 +1052,208 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No output folder", "No output folder yet.")
             return
         try:
-            os.startfile(self._last_out_dir)  # Windows
+            os.startfile(self._last_out_dir)
         except Exception as e:
             QMessageBox.warning(self, "Open failed", str(e))
 
     def _apply_stylesheet(self):
         self.setStyleSheet(
             """
-            QMainWindow, QWidget {
-                background-color: #f5f5f5;
-                color: #1a1a1a;
+            QMainWindow, QWidget#Root {
+                background-color: #f3f4f5;
+                color: #2b2f33;
                 font-family: Segoe UI, Arial, sans-serif;
                 font-size: 10pt;
             }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-                margin-top: 6px;
-                padding-top: 8px;
+            QLabel {
+                background: transparent;
             }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-                color: #444;
+            QLabel#AppTitle {
+                font-size: 19pt;
+                font-weight: 700;
+                color: #2b2f33;
+            }
+            QLabel#AppSubtitle {
+                font-size: 9.5pt;
+                color: #565b60;
+            }
+            QLabel#Badge, QLabel#WarningBadge, QLabel#CountBadge {
+                border-radius: 12px;
+                padding: 5px 10px;
+                font-weight: 600;
+            }
+            QLabel#Badge, QLabel#CountBadge {
+                background-color: #eceff1;
+                color: #3a3a3a;
+            }
+            QLabel#WarningBadge {
+                background-color: #3a3a3a;
+                color: white;
+            }
+            QFrame#Card, QFrame#AccentCard, QFrame#BottomPanel {
+                background-color: #ffffff;
+                border: 1px solid #d9dde1;
+                border-radius: 13px;
+            }
+            QFrame#AccentCard {
+                background-color: #f6f7f8;
+                border-color: #cfd4d9;
+            }
+            QLabel#CardTitle, QLabel#BottomTitle {
+                font-size: 12.5pt;
+                font-weight: 700;
+                color: #2b2f33;
+            }
+            QLabel#SectionLabel, QLabel#HintText {
+                color: #565b60;
+            }
+            QLabel#ValueLabel {
+                min-width: 28px;
+                font-size: 11pt;
+                font-weight: 700;
+                color: #2b2f33;
+            }
+            QLabel#SummaryMetric {
+                font-size: 10.5pt;
+                font-weight: 700;
+                color: #2b2f33;
             }
             QPushButton {
-                background-color: #ffffff;
-                border: 1px solid #c0c0c0;
-                border-radius: 4px;
-                padding: 5px 14px;
+                background-color: #eceff1;
+                color: #2b2f33;
+                border: none;
+                border-radius: 11px;
+                padding: 8px 12px;
+                font-weight: 600;
             }
             QPushButton:hover {
-                background-color: #e8e8e8;
-                border-color: #999;
+                background-color: #dfe3e6;
             }
             QPushButton#ConvertBtn {
-                background-color: #0078d4;
-                color: #ffffff;
-                border: none;
-                font-weight: bold;
-                padding: 5px 20px;
+                background-color: #3a3a3a;
+                color: white;
+                min-height: 38px;
+                font-size: 10.5pt;
             }
             QPushButton#ConvertBtn:hover {
-                background-color: #106ebe;
+                background-color: #2f2f2f;
             }
             QPushButton#ConvertBtn:disabled {
-                background-color: #a0c4e8;
+                background-color: #a7a7a7;
             }
             QLabel#DropZone {
-                border: 2px dashed #b0b0b0;
-                border-radius: 6px;
-                color: #888;
+                border: 2px dashed #cfd4d9;
+                border-radius: 13px;
+                color: #565b60;
                 font-size: 11pt;
-                padding: 20px;
-                background-color: #fafafa;
+                padding: 18px;
+                background-color: #f6f7f8;
             }
             QLabel#DropZone[dragover="true"] {
-                border-color: #0078d4;
-                color: #0078d4;
-                background-color: #e8f2fc;
+                border-color: #3a3a3a;
+                color: #3a3a3a;
+                background-color: #eceff1;
             }
-            QLabel#StatusLabel {
-                color: #444;
-                padding: 2px 0;
+            QListWidget#QueueList {
+                border: 1px solid #d9dde1;
+                border-radius: 12px;
+                background-color: #fafafa;
+                padding: 4px;
+                outline: none;
+            }
+            QListWidget#QueueList::item {
+                border: none;
+                padding: 2px;
+                margin: 1px 0;
+            }
+            QListWidget#QueueList::item:selected {
+                background-color: transparent;
+                color: #2b2f33;
+            }
+            QFrame#QueueRow {
+                background-color: #f5f6f7;
+                border: 1px solid #e4e7ea;
+                border-radius: 11px;
+            }
+            QListWidget#QueueList::item:selected QFrame#QueueRow {
+                background-color: #eceff1;
+                border-color: #cfd4d9;
+            }
+            QLabel#TypeBadge {
+                background-color: #e1e4e8;
+                color: #3a3a3a;
+                border-radius: 9px;
+                padding: 4px 0;
+                font-size: 8.5pt;
+                font-weight: 700;
+            }
+            QLabel#QueueItemName {
+                color: #2b2f33;
+                font-size: 10pt;
+                font-weight: 700;
+            }
+            QLabel#QueueItemPath {
+                color: #4e5358;
+                font-size: 8.8pt;
+            }
+            QLineEdit, QPlainTextEdit {
+                background-color: #f6f7f8;
+                border: 1px solid #d9dde1;
+                border-radius: 11px;
+                padding: 8px 10px;
+                color: #2b2f33;
             }
             QProgressBar {
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-                background-color: #e8e8e8;
-                height: 18px;
-                text-align: center;
+                border: none;
+                border-radius: 10px;
+                background-color: #e4e7ea;
+                min-height: 16px;
             }
             QProgressBar::chunk {
-                background-color: #0078d4;
+                background-color: #3a3a3a;
+                border-radius: 10px;
+            }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #d9dde1;
                 border-radius: 3px;
             }
-            QListWidget, QPlainTextEdit {
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-                background-color: #ffffff;
+            QSlider::sub-page:horizontal {
+                background: #3a3a3a;
+                border-radius: 3px;
             }
-        """
+            QSlider::handle:horizontal {
+                background: #3a3a3a;
+                width: 20px;
+                margin: -7px 0;
+                border-radius: 10px;
+            }
+            QCheckBox {
+                spacing: 8px;
+                color: #2b2f33;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border-radius: 6px;
+                border: 1px solid #cfd4d9;
+                background: #f6f7f8;
+            }
+            QCheckBox::indicator:checked {
+                background: #3a3a3a;
+                border-color: #3a3a3a;
+            }
+            """
         )
 
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
 def main():
     app = QApplication(sys.argv)
+    if APP_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
