@@ -1,41 +1,66 @@
-# ComixConvert
+﻿# ComixConvert
 
-**ComixConvert** is a lightweight desktop tool for converting comic archives  
-(**CBR / CBZ**) into **PDF and EPUB** formats.
+**ComixConvert** is a desktop app for converting comic archives (`.cbz`, `.cbr`, `.zip`, `.rar`) into **PDF** and **EPUB**.
 
-It focuses on predictable output, batch processing, and control over image quality, without relying on ImageMagick or Calibre.
+It is built with **PyQt6** and focuses on predictable output, batch processing, and simple control over image quality.
 
-![ComixConvert screenshot](docs/screenshot.png)
-
----
+<p style="text-align: center;">
+  <img src="docs/img.png" alt="CleanText" width="800">
+</p>
 
 ## Features
 
-- Convert **CBR / CBZ → PDF**
-- Convert **CBR / CBZ → EPUB**
-- Drag & drop files and folders
-- Recursive batch processing
-- Adjustable JPEG quality (default: 85)
-- EPUB support with **first image as cover** (optional)
-- One image per page (no image splitting)
-- Built-in log window
-- Multi level progress bar
+- Convert comic archives to **PDF**
+- Convert comic archives to **EPUB**
+- Drag and drop files or folders
+- Recursive folder scan for supported archives
+- Adjustable JPEG quality
+- EPUB cover support using the first image
+- Option to skip duplicate cover page in EPUB
+- Built-in progress and details panel
+- Remembers last output folder and export settings between runs
 
----
-
-## Dependencies
-
-### Runtime (for source usage)
+## Requirements
 
 - **Python 3.10+**
-- **7-Zip** (required for CBR/CBZ extraction)
+- **7-Zip** installed and available in `PATH`, or installed in the default Windows location
 
-### Python packages
+## Install Dependencies
 
 ```bash
-pip install pillow img2pdf tkinterdnd2
+pip install -r requirements
 ```
 
-### License
+## Run From Source
 
-- MIT
+```bash
+py -3 main.py
+```
+
+## Build One EXE
+
+```powershell
+py -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name ComixConvert --add-data "assets\app_icon.svg;assets" main.py
+```
+
+The built file will be created at:
+
+```text
+dist\ComixConvert.exe
+```
+
+## Python Dependencies
+
+- `PyQt6`
+- `Pillow`
+- `img2pdf`
+
+## Notes
+
+- Archives are extracted with **7-Zip**
+- Images are normalized to JPEG before export
+- PDF and EPUB can be generated in the same batch run
+
+## License
+
+MIT
