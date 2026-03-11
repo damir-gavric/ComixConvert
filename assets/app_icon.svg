@@ -1,0 +1,42 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <defs>
+    <linearGradient id="bgGrad" x1="10%" y1="0%" x2="90%" y2="100%">
+      <stop offset="0%" stop-color="#484848" />
+      <stop offset="100%" stop-color="#2a2a2a" />
+    </linearGradient>
+    <linearGradient id="letterGrad" x1="0%" y1="0%" x2="10%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="100%" stop-color="#bbbbbb" />
+    </linearGradient>
+    <filter id="dropShadow" x="-15%" y="-15%" width="130%" height="130%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="rgba(0,0,0,0.45)" />
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="4" y="4" width="192" height="192" rx="44" ry="44"
+        fill="url(#bgGrad)" filter="url(#dropShadow)" />
+
+  <!-- Left C: open on the right side, gap at ~30° top and bottom -->
+  <path d="
+    M 72,44
+    A 36,36 0 1,0 72,156
+    L 72,140
+    A 20,20 0 1,1 72,60
+    Z
+  " fill="url(#letterGrad)" />
+
+  <!-- Arrow: shaft + head between the two C's -->
+  <path d="
+    M 90,93 L 108,93 L 108,86 L 126,100 L 108,114 L 108,107 L 90,107 Z
+  " fill="url(#letterGrad)" />
+
+  <!-- Right C: open on the left side -->
+  <path d="
+    M 130,44
+    A 36,36 0 1,1 130,156
+    L 130,140
+    A 20,20 0 1,0 130,60
+    Z
+  " fill="url(#letterGrad)" />
+</svg>
