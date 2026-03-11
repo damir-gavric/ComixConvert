@@ -2,7 +2,7 @@
 
 **ComixConvert** is a desktop app for converting comic archives (`.cbz`, `.cbr`, `.zip`, `.rar`) into **PDF** and **EPUB**.
 
-7zip is required to use this ComixConvert, download it from here https://www.7-zip.org/download.html. 
+**7zip is required** to use this ComixConvert, download it from here https://www.7-zip.org/download.html. 
 
 Program is built with **PyQt6** and focuses on predictable output, batch processing, and simple control over image quality.
 
