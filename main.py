@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import zipfile
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -17,8 +18,8 @@ from PyQt6.QtWidgets import (
     QLabel, QSlider, QCheckBox, QPushButton, QListWidget, QProgressBar,
     QPlainTextEdit, QFileDialog, QMessageBox, QFrame, QLineEdit, QListWidgetItem,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QSettings, QUrl
+from PyQt6.QtGui import QFont, QIcon, QDesktopServices
 
 SUPPORTED_EXTS = {".cbz", ".cbr", ".zip", ".rar"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -60,10 +61,16 @@ def run_7z_extract(seven_zip: str, archive_path: Path, out_dir: Path) -> None:
         )
 
 
+def is_junk_path(p: Path, root: Path) -> bool:
+    # macOS resource forks (__MACOSX/, ._name) and hidden files are not comic pages
+    parts = p.relative_to(root).parts
+    return any(part == "__MACOSX" or part.startswith(".") for part in parts)
+
+
 def collect_images(root: Path) -> list[Path]:
     imgs = []
     for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS and not is_junk_path(p, root):
             imgs.append(p)
     imgs.sort(key=natural_key)
     return imgs
@@ -170,6 +177,7 @@ def build_epub_from_images(
 
         safe_title = escape(title)
         book_id = str(uuid.uuid4())
+        modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # ---- Cover (first image)
         cover_item_id = None
@@ -285,7 +293,8 @@ def build_epub_from_images(
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:title>{safe_title}</dc:title>
     <dc:language>en</dc:language>
-    <dc:identifier id="uid">{book_id}</dc:identifier>{cover_meta}
+    <dc:identifier id="uid">{book_id}</dc:identifier>
+    <meta property="dcterms:modified">{modified}</meta>{cover_meta}
   </metadata>
   <manifest>
     <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
@@ -317,6 +326,24 @@ def find_archives_in_folder(folder: Path) -> list[Path]:
     return items
 
 
+def unique_output_stems(files: list[Path]) -> list[str]:
+    """
+    One output stem per archive, unique within the batch (case-insensitive,
+    since Windows paths are). Duplicates get " (2)", " (3)", ... appended.
+    """
+    used = set()
+    stems = []
+    for f in files:
+        stem = f.stem
+        n = 2
+        while stem.lower() in used:
+            stem = f"{f.stem} ({n})"
+            n += 1
+        used.add(stem.lower())
+        stems.append(stem)
+    return stems
+
+
 class ConvertWorker(QThread):
     log_line = pyqtSignal(str)
 
@@ -324,7 +351,8 @@ class ConvertWorker(QThread):
     subprogress = pyqtSignal(int, int)    # current_img, total_imgs
     status = pyqtSignal(str)             # status text
 
-    finished = pyqtSignal(int, int, str)  # ok, fail, out_dir
+    # not named "finished": that would shadow QThread.finished
+    done = pyqtSignal(int, int, str)  # ok, fail, out_dir
 
     def __init__(
         self,
@@ -366,7 +394,9 @@ class ConvertWorker(QThread):
         self.subprogress.emit(0, 0)
         self.status.emit("Starting…")
 
-        for idx, archive in enumerate(self.files, start=1):
+        stems = unique_output_stems(self.files)
+
+        for idx, (archive, stem) in enumerate(zip(self.files, stems), start=1):
             self.progress.emit(idx - 1, total)
 
             try:
@@ -392,7 +422,7 @@ class ConvertWorker(QThread):
 
                     def step(cur, tot, name):
                         self.subprogress.emit(cur, tot)
-                        # cur može biti 0 na početku; zato prikazujemo "cur/tot"
+                        # cur can be 0 at the start, hence "cur/tot"
                         self.status.emit(f"[{idx}/{total}] JPEG {cur}/{tot} — {name}")
 
                     jpegs = convert_to_jpegs(imgs, jpeg_dir, self.quality, on_step=step)
@@ -400,13 +430,13 @@ class ConvertWorker(QThread):
                     self.subprogress.emit(0, 0)
 
                     if self.export_pdf:
-                        out_pdf = self.out_dir / (archive.stem + ".pdf")
+                        out_pdf = self.out_dir / (stem + ".pdf")
                         self.status.emit(f"[{idx}/{total}] Building PDF…")
                         self.log_line.emit(f"  Build PDF: {out_pdf.name}")
                         images_to_pdf(jpegs, out_pdf)
 
                     if self.export_epub:
-                        out_epub = self.out_dir / (archive.stem + ".epub")
+                        out_epub = self.out_dir / (stem + ".epub")
                         self.status.emit(f"[{idx}/{total}] Building EPUB…")
                         self.log_line.emit(f"  Build EPUB: {out_epub.name}")
                         build_epub_from_images(
@@ -438,7 +468,7 @@ class ConvertWorker(QThread):
 
         self.status.emit("Ready.")
         self.subprogress.emit(0, 0)
-        self.finished.emit(ok, fail, str(self.out_dir))
+        self.done.emit(ok, fail, str(self.out_dir))
 
 
 class DropZone(QLabel):
@@ -493,6 +523,7 @@ class MainWindow(QMainWindow):
         self.files: list[Path] = []
         self._worker = None
         self._last_out_dir: str | None = None
+        self._restoring = False
 
         central = QWidget()
         central.setObjectName("Root")
@@ -786,19 +817,27 @@ class MainWindow(QMainWindow):
         parent_layout.addWidget(panel, 1)
 
     def _restore_settings(self):
-        out_dir = self._settings.value("output_dir", "", str)
-        if out_dir:
-            self._out_dir_input.setText(out_dir)
-            self._last_out_dir = out_dir
-            self._btn_open_out.setEnabled(True)
+        # Setting widget values fires _save_settings; without this guard the first
+        # restored value would overwrite the not-yet-restored ones with defaults.
+        self._restoring = True
+        try:
+            out_dir = self._settings.value("output_dir", "", str)
+            if out_dir:
+                self._out_dir_input.setText(out_dir)
+                self._last_out_dir = out_dir
+                self._btn_open_out.setEnabled(True)
 
-        self._chk_pdf.setChecked(self._settings.value("export_pdf", True, bool))
-        self._chk_epub.setChecked(self._settings.value("export_epub", True, bool))
-        self._slider.setValue(self._settings.value("jpeg_quality", 85, int))
-        self._chk_cover.setChecked(self._settings.value("epub_cover", True, bool))
-        self._chk_skip_cover_page.setChecked(self._settings.value("epub_skip_cover_page", True, bool))
+            self._chk_pdf.setChecked(self._settings.value("export_pdf", True, bool))
+            self._chk_epub.setChecked(self._settings.value("export_epub", True, bool))
+            self._slider.setValue(self._settings.value("jpeg_quality", 85, int))
+            self._chk_cover.setChecked(self._settings.value("epub_cover", True, bool))
+            self._chk_skip_cover_page.setChecked(self._settings.value("epub_skip_cover_page", True, bool))
+        finally:
+            self._restoring = False
 
     def _save_settings(self, *_args):
+        if self._restoring:
+            return
         self._settings.setValue("output_dir", self._out_dir_input.text().strip())
         self._settings.setValue("export_pdf", self._chk_pdf.isChecked())
         self._settings.setValue("export_epub", self._chk_epub.isChecked())
@@ -1007,7 +1046,8 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._on_file_progress)
         self._worker.status.connect(self._on_status)
         self._worker.subprogress.connect(self._on_subprogress)
-        self._worker.finished.connect(self._on_convert_finished)
+        self._worker.done.connect(self._on_convert_finished)
+        # QThread.finished fires only after run() has returned, so deleting is safe
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.start()
 
@@ -1017,9 +1057,8 @@ class MainWindow(QMainWindow):
         self._progress_info.setText(f"Files: {cur} / {total}")
 
     def _on_status(self, text: str):
-        clean = text.replace("â€¦", "...").replace("â€”", "-")
-        self._set_status(clean)
-        self._subprogress_info.setText(clean)
+        self._set_status(text)
+        self._subprogress_info.setText(text)
 
     def _on_subprogress(self, cur: int, tot: int):
         if tot <= 0:
@@ -1051,10 +1090,8 @@ class MainWindow(QMainWindow):
         if not self._last_out_dir:
             QMessageBox.information(self, "No output folder", "No output folder yet.")
             return
-        try:
-            os.startfile(self._last_out_dir)
-        except Exception as e:
-            QMessageBox.warning(self, "Open failed", str(e))
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(self._last_out_dir)):
+            QMessageBox.warning(self, "Open failed", f"Could not open:\n{self._last_out_dir}")
 
     def _apply_stylesheet(self):
         self.setStyleSheet(

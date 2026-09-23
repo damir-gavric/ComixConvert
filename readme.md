@@ -7,7 +7,7 @@
 Program is built with **PyQt6** and focuses on predictable output, batch processing, and simple control over image quality.
 
 <p style="text-align: center;">
-  <img src="docs/img.png" alt="CleanText" width="800">
+  <img src="docs/img.png" alt="ComixConvert" width="800">
 </p>
 
 ## Features
